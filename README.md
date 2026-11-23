@@ -59,3 +59,33 @@ This starter supports the requested inline `password` property for quick local t
 - Side-by-side response panel
 - Environment switching and rerun
 - HTTP status, duration, headers and formatted response
+
+
+
+Secrets
+- Run Command Palette -> BAW: Set Secret.
+- Store BAW_DEV_USERNAME, BAW_DEV_PASSWORD, BAW_TEST_USERNAME and
+  BAW_TEST_PASSWORD.
+- In env blocks, use username: {{secret.BAW_DEV_USERNAME}} and
+  password: {{secret.BAW_DEV_PASSWORD}}.
+- Secret values are stored with VS Code ExtensionContext.secrets (SecretStorage),
+  not in the .baw file.
+- Run BAW: Delete Secret to remove a stored secret.
+
+Sequential execution
+- Add a sequence block and ordered run: entries.
+- Use the Run Sequence CodeLens above the sequence.
+- Each service HTTP request is awaited before the next begins.
+- Execution stops at the first missing service or failed HTTP response.
+- Successful service responses are saved for later {{Service Name.path}}
+  interpolation. Shared response values remain in memory for the extension session.
+
+Important BAW note
+The runner waits for the service-start HTTP request to return. Some BAW
+configurations may return a process instance/start acknowledgement before the
+underlying BAW process has completed. If that is how your endpoint behaves,
+true process-completion sequencing requires adding a BAW process-instance status
+polling step before the next service is started.
+
+The example response paths (data.customerId, data.orderId, etc.) are illustrative.
+Adjust them to the actual JSON response shape returned by your BAW environment.

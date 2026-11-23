@@ -12,8 +12,14 @@ interface Service {
     range: vscode.Range;
 }
 
+interface Sequence {
+    name: string;
+    services: string[];
+    range: vscode.Range;
+}
+
 interface NamedBlock {
-    type: "env" | "service";
+    type: "env" | "service" | "sequence";
     name: string;
     openBrace: number;
     closeBrace: number;
@@ -22,6 +28,7 @@ interface NamedBlock {
 interface ParsedBaw {
     environments: Environment[];
     services: Service[];
+    sequences: Sequence[];
 }
 
 interface ServiceRunResult {
@@ -104,6 +111,42 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     context.subscriptions.push(
+        vscode.commands.registerCommand("baw.setSecret", async () => {
+            const key = await vscode.window.showInputBox({
+                prompt: "Secret name (for example BAW_PASSWORD)",
+                placeHolder: "BAW_PASSWORD",
+                ignoreFocusOut: true,
+                validateInput: value => /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)
+                    ? undefined
+                    : "Use letters, numbers and underscores; start with a letter or underscore."
+            });
+            if (!key) return;
+
+            const value = await vscode.window.showInputBox({
+                prompt: `Value for secret ${key}`,
+                password: true,
+                ignoreFocusOut: true
+            });
+            if (value === undefined) return;
+
+            await context.secrets.store(`baw.secret.${key}`, value);
+            vscode.window.showInformationMessage(`BAW secret "${key}" saved securely.`);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand("baw.deleteSecret", async () => {
+            const key = await vscode.window.showInputBox({
+                prompt: "Secret name to delete",
+                placeHolder: "BAW_PASSWORD"
+            });
+            if (!key) return;
+            await context.secrets.delete(`baw.secret.${key}`);
+            vscode.window.showInformationMessage(`BAW secret "${key}" deleted.`);
+        })
+    );
+
+    context.subscriptions.push(
         vscode.commands.registerCommand("baw.clearSharedVariables", () => {
             for (const key of Object.keys(sharedVariables)) {
                 delete sharedVariables[key];
@@ -126,7 +169,17 @@ export function activate(context: vscode.ExtensionContext): void {
             "baw.runService",
             async (documentUri: vscode.Uri, serviceName: string) => {
                 const document = await vscode.workspace.openTextDocument(documentUri);
-                await runServiceFromDocument(document, serviceName, envStatusBar);
+                await runServiceFromDocument(document, serviceName, envStatusBar, context);
+            }
+        )
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand(
+            "baw.runSequence",
+            async (documentUri: vscode.Uri, sequenceName: string) => {
+                const document = await vscode.workspace.openTextDocument(documentUri);
+                await runSequenceFromDocument(document, sequenceName, envStatusBar, context);
             }
         )
     );
@@ -173,18 +226,23 @@ class BawCodeLensProvider implements vscode.CodeLensProvider {
     provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
         const parsed = parseBaw(document.getText());
 
-        return parsed.services.map((service) => {
-            const position = new vscode.Position(
-                Math.max(0, service.range.start.line),
-                0
-            );
-
+        const serviceLenses = parsed.services.map((service) => {
+            const position = new vscode.Position(Math.max(0, service.range.start.line), 0);
             return new vscode.CodeLens(new vscode.Range(position, position), {
                 title: `$(play) Run Service: ${service.name}`,
                 command: "baw.runService",
                 arguments: [document.uri, service.name]
             });
         });
+        const sequenceLenses = parsed.sequences.map((sequence) => {
+            const position = new vscode.Position(Math.max(0, sequence.range.start.line), 0);
+            return new vscode.CodeLens(new vscode.Range(position, position), {
+                title: `$(play) Run Sequence: ${sequence.name} (${sequence.services.length} services)`,
+                command: "baw.runSequence",
+                arguments: [document.uri, sequence.name]
+            });
+        });
+        return [...serviceLenses, ...sequenceLenses];
     }
 }
 
@@ -202,11 +260,11 @@ function isBawDocument(document: vscode.TextDocument): boolean {
  */
 function findNamedBlocks(source: string): NamedBlock[] {
     const blocks: NamedBlock[] = [];
-    const re = /^\s*(env|service)\s+([A-Za-z0-9_-]+|"[^"]+")\s*\{/gm;
+    const re = /^\s*(env|service|sequence)\s+([A-Za-z0-9_-]+|"[^"]+")\s*\{/gm;
 
     let match: RegExpExecArray | null;
     while ((match = re.exec(source)) !== null) {
-        const type = match[1] as "env" | "service";
+        const type = match[1] as "env" | "service" | "sequence";
         const rawName = match[2];
         const name = rawName.replace(/^"|"$/g, "");
         const openBrace = re.lastIndex - 1;
@@ -274,6 +332,7 @@ function findMatchingBrace(source: string, openBrace: number): number {
 function parseBaw(source: string): ParsedBaw {
     const environments: Environment[] = [];
     const services: Service[] = [];
+    const sequences: Sequence[] = [];
     const blocks = findNamedBlocks(source);
 
     for (const block of blocks) {
@@ -286,6 +345,15 @@ function parseBaw(source: string): ParsedBaw {
             environments.push({
                 name: block.name,
                 properties: parseEnvironmentProperties(blockContent)
+            });
+        } else if (block.type === "sequence") {
+            const runMatches = [...blockContent.matchAll(/^\s*run\s*:\s*("[^"]+"|[A-Za-z0-9_-]+)\s*$/gm)];
+            const servicesInSequence = runMatches.map(match => match[1].replace(/^"|"$/g, ""));
+            const start = new vscode.Position(source.slice(0, block.openBrace).split("\n").length - 1, 0);
+            sequences.push({
+                name: block.name,
+                services: servicesInSequence,
+                range: new vscode.Range(start, start)
             });
         } else {
             const idMatch = blockContent.match(
@@ -317,7 +385,7 @@ function parseBaw(source: string): ParsedBaw {
         }
     }
 
-    return { environments, services };
+    return { environments, services, sequences };
 }
 
 function parseEnvironmentProperties(content: string): Record<string, string> {
@@ -376,7 +444,8 @@ function extractServiceJson(content: string): string | undefined {
 async function runServiceFromDocument(
     document: vscode.TextDocument,
     serviceName: string,
-    envStatusBar: vscode.StatusBarItem
+    envStatusBar: vscode.StatusBarItem,
+    context: vscode.ExtensionContext
 ): Promise<void> {
     const parsed = parseBaw(document.getText());
     const service = parsed.services.find((item) => item.name === serviceName);
@@ -404,7 +473,8 @@ async function runServiceFromDocument(
     }
 
     try {
-        const result = await executeService(service, environment);
+        const resolvedEnvironment = await resolveEnvironmentSecrets(environment, context.secrets);
+        const result = await executeService(service, resolvedEnvironment);
         lastRun = result;
         storeServiceResponse(service.name, result.response);
 
@@ -418,6 +488,88 @@ async function runServiceFromDocument(
             `${service.name} failed: ${message}`
         );
     }
+}
+
+async function runSequenceFromDocument(
+    document: vscode.TextDocument,
+    sequenceName: string,
+    envStatusBar: vscode.StatusBarItem,
+    context: vscode.ExtensionContext
+): Promise<void> {
+    const parsed = parseBaw(document.getText());
+    const sequence = parsed.sequences.find(item => item.name === sequenceName);
+    if (!sequence) {
+        vscode.window.showErrorMessage(`Sequence not found: ${sequenceName}`);
+        return;
+    }
+    if (sequence.services.length === 0) {
+        vscode.window.showWarningMessage(`Sequence "${sequenceName}" has no run entries.`);
+        return;
+    }
+    let environment = parsed.environments.find(item => item.name === activeEnvironment) || parsed.environments[0];
+    if (!environment) {
+        vscode.window.showErrorMessage("No environments found in this .baw file.");
+        return;
+    }
+    activeEnvironment = environment.name;
+    envStatusBar.text = `$(globe) BAW: ${activeEnvironment}`;
+
+    // Each run is awaited. A failed service stops the sequence; later services
+    // are not attempted, and successful responses remain in sharedVariables.
+    for (let index = 0; index < sequence.services.length; index++) {
+        const serviceName = sequence.services[index];
+        const service = parsed.services.find(item => item.name === serviceName);
+        if (!service) {
+            vscode.window.showErrorMessage(`Sequence "${sequenceName}": service "${serviceName}" was not found. Stopping.`);
+            return;
+        }
+        try {
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `BAW sequence: ${sequenceName}`,
+                cancellable: false
+            }, async progress => {
+                progress.report({ message: `(${index + 1}/${sequence.services.length}) ${serviceName}` });
+                const resolvedEnvironment = await resolveEnvironmentSecrets(environment!, context.secrets);
+                const result = await executeService(service, resolvedEnvironment);
+                lastRun = result;
+                storeServiceResponse(service.name, result.response);
+                showResponsePanelForResult(result);
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Sequence "${sequenceName}" stopped at "${serviceName}": ${message}`);
+            return;
+        }
+    }
+    vscode.window.showInformationMessage(`Sequence "${sequenceName}" completed (${sequence.services.length} services).`);
+}
+
+async function resolveEnvironmentSecrets(
+    environment: Environment,
+    secrets: vscode.SecretStorage
+): Promise<Environment> {
+    const properties: Record<string, string> = {};
+    for (const [key, rawValue] of Object.entries(environment.properties)) {
+        const match = rawValue.match(/^\{\{\s*secret\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$/);
+        if (match) {
+            const secretValue = await secrets.get(`baw.secret.${match[1]}`);
+            if (secretValue === undefined) {
+                const action = await vscode.window.showWarningMessage(
+                    `Secret "${match[1]}" is not set.`,
+                    "Set Secret"
+                );
+                if (action === "Set Secret") {
+                    await vscode.commands.executeCommand("baw.setSecret");
+                }
+                throw new Error(`Missing secret: ${match[1]}. Run "BAW: Set Secret" and retry.`);
+            }
+            properties[key] = secretValue;
+        } else {
+            properties[key] = rawValue;
+        }
+    }
+    return { name: environment.name, properties };
 }
 
 async function executeService(
@@ -505,6 +657,8 @@ async function executeService(
  *   {{orderNumber}}                  environment variable
  *   {{Create Order.orderId}}         previous service response value
  *   {{Create Order.data.order.id}}   nested previous service response value
+ * Secrets are referenced in environment properties as {{secret.SECRET_NAME}}
+ * and are retrieved from VS Code SecretStorage (not from the .baw file).
  */
 function resolveVariables(
     content: string,

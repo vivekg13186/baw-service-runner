@@ -5,26 +5,43 @@
   "repository": "https://github.com/vivekg13186/baw-service-runner.git",
   "version": "0.1.0",
   "publisher": "vivekg",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
-  "activationEvents": ["onLanguage:baw"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:baw"
+  ],
   "main": "./out/extension.js",
   "contributes": {
-    "languages": [{
-      "id": "baw",
-      "aliases": ["BAW", "baw"],
-      "extensions": [".baw"],
-      "configuration": "./language-configuration.json"
-    }],
-    "grammars": [{
-      "language": "baw",
-      "scopeName": "source.baw",
-      "path": "./syntaxes/baw.tmLanguage.json"
-    }],
-    "commands": [{
-      "command": "baw.runService",
-      "title": "BAW: Run Service"
-    }]
+    "commands": [
+      {
+        "command": "baw.setEnvironment",
+        "title": "BAW: Select Environment"
+      },
+      {
+        "command": "baw.setSecret",
+        "title": "BAW: Set Secret"
+      },
+      {
+        "command": "baw.deleteSecret",
+        "title": "BAW: Delete Secret"
+      },
+      {
+        "command": "baw.clearSharedVariables",
+        "title": "BAW: Clear Shared Variables"
+      },
+      {
+        "command": "baw.showResponse",
+        "title": "BAW: Show Response"
+      },
+      {
+        "command": "baw.runSequence",
+        "title": "BAW: Run Sequence"
+      }
+    ]
   },
   "scripts": {
     "compile": "tsc -p ./",
