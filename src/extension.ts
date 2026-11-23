@@ -1,306 +1,776 @@
 import * as vscode from "vscode";
 
-type Environment = {
-  name: string;
-  url: string;
-  username: string;
-  password: string;
-};
+interface Environment {
+    name: string;
+    properties: Record<string, string>;
+}
 
-type Service = {
-  name: string;
-  id: string;
-  input: unknown;
-};
+interface Service {
+    name: string;
+    id: string;
+    body: string;
+    range: vscode.Range;
+}
 
-type BawFile = {
-  environments: Environment[];
-  services: Service[];
-};
+interface NamedBlock {
+    type: "env" | "service";
+    name: string;
+    openBrace: number;
+    closeBrace: number;
+}
 
+interface ParsedBaw {
+    environments: Environment[];
+    services: Service[];
+}
+
+interface ServiceRunResult {
+    serviceName: string;
+    status: number;
+    statusText: string;
+    durationMs: number;
+    response: unknown;
+    responseText: string;
+    requestUrl: string;
+    requestBody: string;
+}
+
+let activeEnvironment = "";
 let responsePanel: vscode.WebviewPanel | undefined;
-let lastRun: { service: Service; environments: Environment[]; selectedEnv: string } | undefined;
+let lastRun: ServiceRunResult | undefined;
 
-export function activate(context: vscode.ExtensionContext) {
-  context.subscriptions.push(
-    vscode.languages.registerCodeLensProvider({ language: "baw" }, {
-      provideCodeLenses(document) {
-        const parsed = parseBaw(document.getText());
-        const lenses: vscode.CodeLens[] = [];
-        for (const service of parsed.services) {
-          const line = findServiceLine(document, service.name);
-          if (line >= 0) {
-            lenses.push(new vscode.CodeLens(new vscode.Range(line, 0, line, 0), {
-              title: `▶ Run Service: ${service.name}`,
-              command: "baw.runService",
-              arguments: [document.uri, service.name]
-            }));
-          }
-        }
-        return lenses;
-      }
-    })
-  );
+/**
+ * Values returned by previously executed services.
+ *
+ * Example:
+ * sharedVariables["Create Order"] = {
+ *   orderId: "ORD-1001"
+ * };
+ *
+ * Then a later service can use {{Create Order.orderId}}.
+ */
+const sharedVariables: Record<string, unknown> = {};
 
-  context.subscriptions.push(
-    vscode.commands.registerCommand("baw.runService", async (uri?: vscode.Uri, serviceName?: string) => {
-      const document = uri
-        ? await vscode.workspace.openTextDocument(uri)
-        : vscode.window.activeTextEditor?.document;
-
-      if (!document || document.languageId !== "baw") {
-        vscode.window.showErrorMessage("Open a .baw file first.");
-        return;
-      }
-
-      try {
-        const parsed = parseBaw(document.getText());
-        const service = parsed.services.find(s => s.name === serviceName) ?? parsed.services[0];
-        if (!service) throw new Error("No service records found in this .baw file.");
-        if (!parsed.environments.length) throw new Error("No env records found in this .baw file.");
-
-        const selected = lastRun?.selectedEnv && parsed.environments.some(e => e.name === lastRun.selectedEnv)
-          ? lastRun.selectedEnv
-          : parsed.environments[0].name;
-
-        lastRun = { service, environments: parsed.environments, selectedEnv: selected };
-        showResponsePanel(context, service, parsed.environments, selected);
-        await executeService(service, parsed.environments.find(e => e.name === selected)!, selected);
-      } catch (error) {
-        vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
-      }
-    })
-  );
-}
-
-function parseBaw(source: string): BawFile {
-  const environments: Environment[] = [];
-  const services: Service[] = [];
-
-  const blocks = findNamedBlocks(source);
-  for (const block of blocks) {
-    if (block.kind === "env") {
-      const values = parseProperties(block.body);
-      if (!values.url || !values.username || values.password === undefined) {
-        throw new Error(`Environment "${block.name}" requires url, username and password.`);
-      }
-      environments.push({
-        name: block.name,
-        url: values.url.replace(/\/+$/, ""),
-        username: values.username,
-        password: values.password
-      });
-    } else {
-      const id = block.body.match(/^\s*id\s*:\s*([^\r\n]+)\s*$/m)?.[1]?.trim();
-      if (!id) throw new Error(`Service "${block.name}" is missing id:`);
-      const jsonStart = block.body.indexOf("{");
-      if (jsonStart < 0) throw new Error(`Service "${block.name}" is missing its JSON input block.`);
-      const jsonEnd = findMatchingBrace(block.body, jsonStart);
-      if (jsonEnd < 0) throw new Error(`Service "${block.name}" has an unclosed JSON input block.`);
-      const jsonText = block.body.slice(jsonStart, jsonEnd + 1);
-      let input: unknown;
-      try { input = JSON.parse(jsonText); }
-      catch (e) { throw new Error(`Invalid JSON in service "${block.name}": ${e instanceof Error ? e.message : String(e)}`); }
-      services.push({ name: block.name, id, input });
-    }
-  }
-  return { environments, services };
-}
-
-function findNamedBlocks(source: string): Array<{kind: "env" | "service"; name: string; body: string}> {
-  const results: Array<{kind: "env" | "service"; name: string; body: string}> = [];
-  const re = /\b(env|service)\s+"([^"]+)"\s*\{/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(source))) {
-    const open = source.indexOf("{", match.index);
-    const close = findMatchingBrace(source, open);
-    if (close < 0) throw new Error(`Unclosed ${match[1]} block "${match[2]}".`);
-    results.push({
-      kind: match[1] as "env" | "service",
-      name: match[2],
-      body: source.slice(open + 1, close)
-    });
-    re.lastIndex = close + 1;
-  }
-  return results;
-}
-
-function findMatchingBrace(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < text.length; i++) {
-    const c = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (c === "\\\\") escaped = true;
-      else if (c === '"') inString = false;
-      continue;
-    }
-    if (c === '"') inString = true;
-    else if (c === "{") depth++;
-    else if (c === "}" && --depth === 0) return i;
-  }
-  return -1;
-}
-
-function parseProperties(body: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const line of body.split(/\r?\n/)) {
-    const match = line.match(/^\s*(url|username|password)\s*:\s*(.*?)\s*$/);
-    if (match) result[match[1]] = match[2].replace(/^["']|["']$/g, "");
-  }
-  return result;
-}
-
-function findServiceLine(document: vscode.TextDocument, name: string): number {
-  for (let i = 0; i < document.lineCount; i++) {
-    if (document.lineAt(i).text.includes(`service "${name}"`)) return i;
-  }
-  return -1;
-}
-
-function showResponsePanel(
-  context: vscode.ExtensionContext,
-  service: Service,
-  environments: Environment[],
-  selectedEnv: string
-) {
-  if (!responsePanel) {
-    responsePanel = vscode.window.createWebviewPanel(
-      "bawResponse",
-      "BAW Response",
-      vscode.ViewColumn.Beside,
-      { enableScripts: true, retainContextWhenHidden: true }
+export function activate(context: vscode.ExtensionContext): void {
+    const envStatusBar = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Left,
+        100
     );
-    responsePanel.onDidDispose(() => { responsePanel = undefined; });
-    responsePanel.webview.onDidReceiveMessage(async message => {
-      if (message.type === "run" && lastRun) {
-        const env = lastRun.environments.find(e => e.name === message.environment);
-        if (!env) return;
-        lastRun.selectedEnv = env.name;
-        await executeService(lastRun.service, env, env.name);
-      }
-      if (message.type === "copy") {
-        await vscode.env.clipboard.writeText(String(message.text ?? ""));
-        vscode.window.showInformationMessage("Response copied.");
-      }
-    });
-  }
-  responsePanel.title = `BAW: ${service.name}`;
-  responsePanel.webview.html = getHtml(service, environments, selectedEnv);
+    envStatusBar.command = "baw.setEnvironment";
+    envStatusBar.tooltip = "Select the BAW environment";
+    envStatusBar.text = `$(globe) BAW: ${activeEnvironment || "Select Env"}`;
+    envStatusBar.show();
+
+    context.subscriptions.push(envStatusBar);
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand("baw.setEnvironment", async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || !isBawDocument(editor.document)) {
+                vscode.window.showWarningMessage(
+                    "Open a .baw file to select its environment."
+                );
+                return;
+            }
+
+            const parsed = parseBaw(editor.document.getText());
+            if (parsed.environments.length === 0) {
+                vscode.window.showWarningMessage(
+                    "No environments found. Use: env dev { ... }"
+                );
+                return;
+            }
+
+            const selected = await vscode.window.showQuickPick(
+                parsed.environments.map((env) => ({
+                    label: env.name,
+                    description: env.properties.url || ""
+                })),
+                { placeHolder: "Select BAW environment" }
+            );
+
+            if (!selected) {
+                return;
+            }
+
+            activeEnvironment = selected.label;
+            envStatusBar.text = `$(globe) BAW: ${activeEnvironment}`;
+
+            if (lastRun) {
+                lastRun = { ...lastRun };
+            }
+            updateResponsePanel();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand("baw.clearSharedVariables", () => {
+            for (const key of Object.keys(sharedVariables)) {
+                delete sharedVariables[key];
+            }
+            vscode.window.showInformationMessage(
+                "BAW shared variables cleared."
+            );
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.languages.registerCodeLensProvider(
+            { language: "baw", scheme: "file" },
+            new BawCodeLensProvider()
+        )
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand(
+            "baw.runService",
+            async (documentUri: vscode.Uri, serviceName: string) => {
+                const document = await vscode.workspace.openTextDocument(documentUri);
+                await runServiceFromDocument(document, serviceName, envStatusBar);
+            }
+        )
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand("baw.showResponse", () => {
+            showResponsePanel(context);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeTextDocument((event) => {
+            if (isBawDocument(event.document)) {
+                vscode.commands.executeCommand(
+                    "vscode.executeCodeLensProvider",
+                    event.document.uri
+                );
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidCloseTextDocument((document) => {
+            if (isBawDocument(document)) {
+                // Shared variables intentionally remain available for the
+                // current extension session, even if the editor is closed.
+            }
+        })
+    );
+
+    // Keep the status bar label in sync when the active editor changes.
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor(() => {
+            envStatusBar.text = `$(globe) BAW: ${activeEnvironment || "Select Env"}`;
+        })
+    );
 }
 
-async function executeService(service: Service, env: Environment, selectedEnv: string) {
-  if (!responsePanel) return;
-  const started = Date.now();
-  responsePanel.webview.postMessage({ type: "running", environment: selectedEnv });
-
-  const url = `${env.url}/rest/bpm/wle/v1/service/${encodeURIComponent(service.id)}`;
-  const params = new URLSearchParams({
-    action: "start",
-    params: JSON.stringify(service.input)
-  });
-
-  try {
-    const response = await fetch(`${url}?${params.toString()}`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Basic ${Buffer.from(`${env.username}:${env.password}`).toString("base64")}`,
-        "Accept": "application/json"
-      }
-    });
-    const text = await response.text();
-    let body: unknown = text;
-    try { body = JSON.parse(text); } catch { /* keep text response */ }
-
-    responsePanel?.webview.postMessage({
-      type: "result",
-      status: response.status,
-      statusText: response.statusText,
-      duration: Date.now() - started,
-      headers: Array.from(response.headers.entries()).map(([name, value]) => `${name}: ${value}`).join("\n"),
-      body: JSON.stringify(body, null, 2),
-      environment: selectedEnv
-    });
-  } catch (error) {
-    responsePanel?.webview.postMessage({
-      type: "error",
-      duration: Date.now() - started,
-      message: error instanceof Error ? error.message : String(error),
-      environment: selectedEnv
-    });
-  }
+export function deactivate(): void {
+    // Nothing to dispose manually; subscriptions are managed by VS Code.
 }
 
-function getHtml(service: Service, environments: Environment[], selected: string): string {
-  const options = environments.map(e =>
-    `<option value="${escapeHtml(e.name)}" ${e.name === selected ? "selected" : ""}>${escapeHtml(e.name)}</option>`
-  ).join("");
-  return `<!DOCTYPE html>
-<html lang="en">
+class BawCodeLensProvider implements vscode.CodeLensProvider {
+    provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+        const parsed = parseBaw(document.getText());
+
+        return parsed.services.map((service) => {
+            const position = new vscode.Position(
+                Math.max(0, service.range.start.line),
+                0
+            );
+
+            return new vscode.CodeLens(new vscode.Range(position, position), {
+                title: `$(play) Run Service: ${service.name}`,
+                command: "baw.runService",
+                arguments: [document.uri, service.name]
+            });
+        });
+    }
+}
+
+function isBawDocument(document: vscode.TextDocument): boolean {
+    return document.languageId === "baw" ||
+        document.fileName.toLowerCase().endsWith(".baw");
+}
+
+/**
+ * Finds env/service blocks. Environment names can be unquoted:
+ *   env dev {
+ *
+ * Service names can be quoted:
+ *   service "Create Order" {
+ */
+function findNamedBlocks(source: string): NamedBlock[] {
+    const blocks: NamedBlock[] = [];
+    const re = /^\s*(env|service)\s+([A-Za-z0-9_-]+|"[^"]+")\s*\{/gm;
+
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(source)) !== null) {
+        const type = match[1] as "env" | "service";
+        const rawName = match[2];
+        const name = rawName.replace(/^"|"$/g, "");
+        const openBrace = re.lastIndex - 1;
+        const closeBrace = findMatchingBrace(source, openBrace);
+
+        if (closeBrace < 0) {
+            continue;
+        }
+
+        blocks.push({ type, name, openBrace, closeBrace });
+        re.lastIndex = openBrace + 1;
+    }
+
+    return blocks;
+}
+
+/**
+ * Finds the matching closing brace while ignoring braces inside strings
+ * and # comments.
+ */
+function findMatchingBrace(source: string, openBrace: number): number {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let inComment = false;
+
+    for (let i = openBrace; i < source.length; i++) {
+        const ch = source[i];
+
+        if (inComment) {
+            if (ch === "\n") {
+                inComment = false;
+            }
+            continue;
+        }
+
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch === "\\") {
+                escaped = true;
+            } else if (ch === "\"") {
+                inString = false;
+            }
+            continue;
+        }
+
+        if (ch === "#") {
+            inComment = true;
+        } else if (ch === "\"") {
+            inString = true;
+        } else if (ch === "{") {
+            depth++;
+        } else if (ch === "}") {
+            depth--;
+            if (depth === 0) {
+                return i;
+            }
+        }
+    }
+
+    return -1;
+}
+
+function parseBaw(source: string): ParsedBaw {
+    const environments: Environment[] = [];
+    const services: Service[] = [];
+    const blocks = findNamedBlocks(source);
+
+    for (const block of blocks) {
+        const blockContent = source.slice(
+            block.openBrace + 1,
+            block.closeBrace
+        );
+
+        if (block.type === "env") {
+            environments.push({
+                name: block.name,
+                properties: parseEnvironmentProperties(blockContent)
+            });
+        } else {
+            const idMatch = blockContent.match(
+                /^\s*id\s*:\s*([^\r\n#]+)\s*$/m
+            );
+            const id = idMatch?.[1]?.trim();
+
+            if (!id) {
+                continue;
+            }
+
+            const body = extractServiceJson(blockContent);
+            if (!body) {
+                continue;
+            }
+
+            const startOffset = block.openBrace;
+            const start = new vscode.Position(
+                source.slice(0, startOffset).split("\n").length - 1,
+                0
+            );
+
+            services.push({
+                name: block.name,
+                id,
+                body,
+                range: new vscode.Range(start, start)
+            });
+        }
+    }
+
+    return { environments, services };
+}
+
+function parseEnvironmentProperties(content: string): Record<string, string> {
+    const properties: Record<string, string> = {};
+
+    for (const line of content.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) {
+            continue;
+        }
+
+        const match = trimmed.match(/^([A-Za-z_][\w.-]*)\s*:\s*(.*?)\s*$/);
+        if (match) {
+            properties[match[1]] = unquote(match[2]);
+        }
+    }
+
+    return properties;
+}
+
+function unquote(value: string): string {
+    if (
+        (value.startsWith("\"") && value.endsWith("\"")) ||
+        (value.startsWith("'") && value.endsWith("'"))
+    ) {
+        return value.slice(1, -1);
+    }
+    return value;
+}
+
+/**
+ * Service blocks contain an id line followed by a JSON object.
+ * The first opening brace after the id line starts the JSON body.
+ */
+function extractServiceJson(content: string): string | undefined {
+    const idMatch = /^\s*id\s*:\s*[^\r\n#]+\s*$/m.exec(content);
+    if (!idMatch) {
+        return undefined;
+    }
+
+    const afterId = content.slice(idMatch.index + idMatch[0].length);
+    const jsonOpenRelative = afterId.indexOf("{");
+    if (jsonOpenRelative < 0) {
+        return undefined;
+    }
+
+    const jsonOpen = idMatch.index + idMatch[0].length + jsonOpenRelative;
+    const jsonClose = findMatchingBrace(content, jsonOpen);
+    if (jsonClose < 0) {
+        return undefined;
+    }
+
+    return content.slice(jsonOpen, jsonClose + 1).trim();
+}
+
+async function runServiceFromDocument(
+    document: vscode.TextDocument,
+    serviceName: string,
+    envStatusBar: vscode.StatusBarItem
+): Promise<void> {
+    const parsed = parseBaw(document.getText());
+    const service = parsed.services.find((item) => item.name === serviceName);
+
+    if (!service) {
+        vscode.window.showErrorMessage(`Service not found: ${serviceName}`);
+        return;
+    }
+
+    if (parsed.environments.length === 0) {
+        vscode.window.showErrorMessage(
+            "No environments found. Add an env block, for example: env dev { ... }"
+        );
+        return;
+    }
+
+    let environment = parsed.environments.find(
+        (item) => item.name === activeEnvironment
+    );
+
+    if (!environment) {
+        environment = parsed.environments[0];
+        activeEnvironment = environment.name;
+        envStatusBar.text = `$(globe) BAW: ${activeEnvironment}`;
+    }
+
+    try {
+        const result = await executeService(service, environment);
+        lastRun = result;
+        storeServiceResponse(service.name, result.response);
+
+        showResponsePanelForResult(result);
+        vscode.window.showInformationMessage(
+            `${service.name} completed (HTTP ${result.status}).`
+        );
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(
+            `${service.name} failed: ${message}`
+        );
+    }
+}
+
+async function executeService(
+    service: Service,
+    environment: Environment
+): Promise<ServiceRunResult> {
+    const baseUrl = environment.properties.url;
+    const username = environment.properties.username;
+    const password = environment.properties.password;
+
+    if (!baseUrl) {
+        throw new Error(`Environment "${environment.name}" has no url property.`);
+    }
+
+    if (!username || !password) {
+        throw new Error(
+            `Environment "${environment.name}" must define username and password.`
+        );
+    }
+
+    // Environment properties are available as {{variable}}.
+    // Previously executed service results are available as {{Service Name.path}}.
+    const resolvedBody = resolveVariables(service.body, environment.properties);
+    let params: unknown;
+
+    try {
+        params = JSON.parse(resolvedBody);
+    } catch (error) {
+        throw new Error(
+            `Invalid JSON after variable replacement: ${
+                error instanceof Error ? error.message : String(error)
+            }`
+        );
+    }
+
+    const encodedParams = encodeURIComponent(JSON.stringify(params));
+    const serviceId = encodeURIComponent(service.id);
+    const requestUrl =
+        `${baseUrl.replace(/\/+$/, "")}/rest/bpm/wle/v1/service/` +
+        `${serviceId}?action=start&params=${encodedParams}`;
+
+    const auth = Buffer.from(`${username}:${password}`).toString("base64");
+    const startedAt = Date.now();
+
+    const response = await fetch(requestUrl, {
+        method: "POST",
+        headers: {
+            Authorization: `Basic ${auth}`,
+            Accept: "application/json"
+        }
+    });
+
+    const responseText = await response.text();
+    const durationMs = Date.now() - startedAt;
+
+    let responseData: unknown = responseText;
+    try {
+        responseData = responseText ? JSON.parse(responseText) : null;
+    } catch {
+        // Keep non-JSON responses as text.
+    }
+
+    const result: ServiceRunResult = {
+        serviceName: service.name,
+        status: response.status,
+        statusText: response.statusText,
+        durationMs,
+        response: responseData,
+        responseText,
+        requestUrl,
+        requestBody: JSON.stringify(params, null, 2)
+    };
+
+    if (!response.ok) {
+        throw new Error(
+            `HTTP ${response.status} ${response.statusText}\n${responseText}`
+        );
+    }
+
+    return result;
+}
+
+/**
+ * Replaces:
+ *   {{orderNumber}}                  environment variable
+ *   {{Create Order.orderId}}         previous service response value
+ *   {{Create Order.data.order.id}}   nested previous service response value
+ */
+function resolveVariables(
+    content: string,
+    environmentVariables: Record<string, string>
+): string {
+    const variables: Record<string, unknown> = {
+        ...environmentVariables,
+        ...sharedVariables
+    };
+
+    return content.replace(
+        /\{\{\s*([^{}]+?)\s*\}\}/g,
+        (_match, expression: string) => {
+            const value = resolveVariableExpression(
+                expression.trim(),
+                variables
+            );
+
+            if (value === undefined || value === null) {
+                throw new Error(`Variable not found: {{${expression}}}`);
+            }
+
+            if (typeof value === "object") {
+                return JSON.stringify(value);
+            }
+
+            return String(value);
+        }
+    );
+}
+
+function resolveVariableExpression(
+    expression: string,
+    variables: Record<string, unknown>
+): unknown {
+    // Match the longest known service name first. This permits service names
+    // containing spaces, for example "Create Order.orderId".
+    const rootNames = Object.keys(variables).sort(
+        (a, b) => b.length - a.length
+    );
+
+    for (const rootName of rootNames) {
+        if (expression === rootName) {
+            return variables[rootName];
+        }
+
+        if (expression.startsWith(`${rootName}.`)) {
+            const path = expression.slice(rootName.length + 1);
+            return getNestedValue(variables[rootName], path);
+        }
+    }
+
+    // Simple environment variable such as {{orderNumber}}.
+    if (Object.prototype.hasOwnProperty.call(variables, expression)) {
+        return variables[expression];
+    }
+
+    // Fallback: split at the first dot. This is useful if a response has
+    // been stored under a service name that is not otherwise an exact prefix.
+    const firstDot = expression.indexOf(".");
+    if (firstDot > 0) {
+        const root = expression.slice(0, firstDot);
+        const path = expression.slice(firstDot + 1);
+        return getNestedValue(variables[root], path);
+    }
+
+    return undefined;
+}
+
+function getNestedValue(value: unknown, path: string): unknown {
+    return path.split(".").reduce<unknown>((current, part) => {
+        if (current === null || current === undefined) {
+            return undefined;
+        }
+
+        if (Array.isArray(current) && /^\d+$/.test(part)) {
+            return current[Number(part)];
+        }
+
+        if (typeof current === "object") {
+            return (current as Record<string, unknown>)[part];
+        }
+
+        return undefined;
+    }, value);
+}
+
+function storeServiceResponse(
+    serviceName: string,
+    response: unknown
+): void {
+    sharedVariables[serviceName] = response;
+}
+
+function showResponsePanel(context: vscode.ExtensionContext): void {
+    if (responsePanel) {
+        responsePanel.reveal(vscode.ViewColumn.Beside);
+        updateResponsePanel();
+        return;
+    }
+
+    responsePanel = vscode.window.createWebviewPanel(
+        "bawResponse",
+        "BAW Response",
+        vscode.ViewColumn.Beside,
+        {
+            enableScripts: true,
+            retainContextWhenHidden: true
+        }
+    );
+
+    responsePanel.onDidDispose(() => {
+        responsePanel = undefined;
+    }, null, context.subscriptions);
+
+    responsePanel.webview.onDidReceiveMessage(async (message) => {
+        if (message.command === "clearVariables") {
+            for (const key of Object.keys(sharedVariables)) {
+                delete sharedVariables[key];
+            }
+            updateResponsePanel();
+            vscode.window.showInformationMessage(
+                "BAW shared variables cleared."
+            );
+        }
+    }, undefined, context.subscriptions);
+
+    updateResponsePanel();
+}
+
+function showResponsePanelForResult(result: ServiceRunResult): void {
+    if (!responsePanel) {
+        responsePanel = vscode.window.createWebviewPanel(
+            "bawResponse",
+            "BAW Response",
+            vscode.ViewColumn.Beside,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true
+            }
+        );
+
+        responsePanel.onDidDispose(() => {
+            responsePanel = undefined;
+        });
+        responsePanel.webview.onDidReceiveMessage(async (message) => {
+            if (message.command === "clearVariables") {
+                for (const key of Object.keys(sharedVariables)) {
+                    delete sharedVariables[key];
+                }
+                updateResponsePanel();
+                vscode.window.showInformationMessage(
+                    "BAW shared variables cleared."
+                );
+            }
+        });
+    } else {
+        responsePanel.reveal(vscode.ViewColumn.Beside);
+    }
+
+    responsePanel.webview.html = renderResponseHtml(result);
+}
+
+function updateResponsePanel(): void {
+    if (!responsePanel) {
+        return;
+    }
+
+    if (lastRun) {
+        responsePanel.webview.html = renderResponseHtml(lastRun);
+    } else {
+        responsePanel.webview.html = renderEmptyResponseHtml();
+    }
+}
+
+function renderEmptyResponseHtml(): string {
+    return `<!DOCTYPE html>
+<html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
-<title>BAW Response</title>
 <style>
-:root { color-scheme: light dark; }
-body { padding: 16px 22px; color: var(--vscode-foreground); font-family: var(--vscode-font-family); }
-.toolbar { display:flex; align-items:center; gap:12px; position:sticky; top:0; padding:10px 0; background:var(--vscode-editor-background); }
-select, button { color:var(--vscode-foreground); background:var(--vscode-dropdown-background); border:1px solid var(--vscode-dropdown-border); padding:7px 10px; border-radius:4px; }
-button { cursor:pointer; }
-.meta { color:var(--vscode-descriptionForeground); margin:12px 0; }
-pre { white-space:pre-wrap; overflow-wrap:anywhere; background:var(--vscode-textCodeBlock-background); padding:14px; border-radius:5px; }
-#status { font-weight:600; }
+body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 16px; }
+pre { white-space: pre-wrap; }
+button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; padding: 6px 12px; cursor: pointer; }
 </style>
 </head>
 <body>
-<h2>${escapeHtml(service.name)}</h2>
-<div class="toolbar">
-  <label for="environment">Environment</label>
-  <select id="environment">${options}</select>
-  <button id="run">▶ Run Service</button>
-  <button id="copy">Copy response</button>
-</div>
-<div class="meta" id="meta">Ready</div>
-<div id="status"></div>
-<h3>Response</h3>
-<pre id="response">Run the service to see the response.</pre>
-<h3>Response headers</h3>
-<pre id="headers">—</pre>
+<h2>BAW Service Runner</h2>
+<p>Run a service using the <b>Run Service</b> CodeLens to see its response here.</p>
+<h3>Shared variables</h3>
+${renderSharedVariablesHtml()}
+<button onclick="vscode.postMessage({command:'clearVariables'})">Clear shared variables</button>
 <script>
 const vscode = acquireVsCodeApi();
-const env = document.getElementById('environment');
-document.getElementById('run').addEventListener('click', () => vscode.postMessage({type:'run', environment:env.value}));
-document.getElementById('copy').addEventListener('click', () => vscode.postMessage({type:'copy', text:document.getElementById('response').textContent}));
-window.addEventListener('message', event => {
-  const m = event.data;
-  if (m.environment) env.value = m.environment;
-  if (m.type === 'running') {
-    document.getElementById('status').textContent = 'Running…';
-    document.getElementById('meta').textContent = 'Executing against ' + m.environment;
-  } else if (m.type === 'result') {
-    document.getElementById('status').textContent = m.status + ' ' + m.statusText;
-    document.getElementById('meta').textContent = m.duration + ' ms · ' + m.environment;
-    document.getElementById('response').textContent = m.body;
-    document.getElementById('headers').textContent = m.headers || '—';
-  } else if (m.type === 'error') {
-    document.getElementById('status').textContent = 'Request failed';
-    document.getElementById('meta').textContent = m.duration + ' ms · ' + m.environment;
-    document.getElementById('response').textContent = m.message;
-    document.getElementById('headers').textContent = '—';
-  }
-});
 </script>
 </body>
 </html>`;
 }
 
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, c => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-  }[c]!));
+function renderResponseHtml(result: ServiceRunResult): string {
+    const response = escapeHtml(
+        typeof result.response === "string"
+            ? result.response
+            : JSON.stringify(result.response, null, 2)
+    );
+    const requestBody = escapeHtml(result.requestBody);
+    const variablesHtml = renderSharedVariablesHtml();
+
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 16px; }
+.meta { color: var(--vscode-descriptionForeground); font-size: 12px; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--vscode-textCodeBlock-background); padding: 12px; border-radius: 4px; }
+h2, h3 { margin-bottom: 8px; }
+button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; padding: 6px 12px; cursor: pointer; }
+.success { color: var(--vscode-testing-iconPassed); }
+.failure { color: var(--vscode-testing-iconFailed); }
+</style>
+</head>
+<body>
+<h2>${escapeHtml(result.serviceName)}</h2>
+<p class="meta">
+<span class="${result.status >= 200 && result.status < 300 ? "success" : "failure"}">
+HTTP ${result.status} ${escapeHtml(result.statusText)}
+</span>
+&nbsp; · &nbsp; ${result.durationMs} ms
+</p>
+<h3>Request URL</h3>
+<pre>${escapeHtml(result.requestUrl)}</pre>
+<h3>Request parameters</h3>
+<pre>${requestBody}</pre>
+<h3>Response</h3>
+<pre>${response}</pre>
+<h3>Shared variables</h3>
+${variablesHtml}
+<button onclick="vscode.postMessage({command:'clearVariables'})">Clear shared variables</button>
+<script>
+const vscode = acquireVsCodeApi();
+</script>
+</body>
+</html>`;
 }
 
-export function deactivate() {}
+function renderSharedVariablesHtml(): string {
+    const entries = Object.entries(sharedVariables);
+
+    if (entries.length === 0) {
+        return "<p class=\"meta\">No shared variables yet. Run a service first.</p>";
+    }
+
+    return entries.map(([name, value]) => {
+        const rendered = escapeHtml(JSON.stringify(value, null, 2));
+        return `<h4>${escapeHtml(name)}</h4><pre>${rendered}</pre>`;
+    }).join("");
+}
+
+function escapeHtml(value: string): string {
+    return value
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}

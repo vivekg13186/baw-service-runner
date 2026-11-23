@@ -1,0 +1,120 @@
+# IBM BAW Service Runner - example file
+#
+# Features demonstrated:
+# - Multiple environments
+# - Environment-specific variables
+# - Variable interpolation with {{variableName}}
+# - Service execution using the Run Service CodeLens
+# - Sharing values from an earlier service response
+# - Nested response property references
+#
+# Run services in this order:
+#   1. Create Customer
+#   2. Create Order
+#   3. Approve Order
+#
+# Shared service response variables are held in memory for the current
+# VS Code extension session. Run the first service before services that
+# reference its response.
+
+env dev {
+    url: https://baw-dev.example.com
+    username: admin
+    password: change-me
+
+    environmentName: development
+    customerName: John Doe
+    customerEmail: john.doe@example.com
+    orderType: STANDARD
+    currency: EUR
+}
+
+env test {
+    url: https://baw-test.example.com
+    username: test-admin
+    password: change-me
+
+    environmentName: testing
+    customerName: Jane Doe
+    customerEmail: jane.doe@example.com
+    orderType: TEST
+    currency: EUR
+}
+
+# Step 1: Create a customer.
+# After running this service, its complete response is stored under
+# the service name "Create Customer".
+service "Create Customer" {
+    id: CustomerApp@CreateCustomer
+    {
+        "name": "{{customerName}}",
+        "email": "{{customerEmail}}",
+        "source": "{{environmentName}}"
+    }
+}
+
+# Step 2: Create an order using a value returned by Create Customer.
+#
+# IMPORTANT:
+# This example assumes the BAW response contains:
+# {
+#   "data": {
+#     "customerId": "..."
+#   }
+# }
+#
+# If your BAW response uses a different structure, change
+# {{Create Customer.data.customerId}} to the correct response path.
+service "Create Order" {
+    id: OrderApp@CreateOrder
+    {
+        "customerId": "{{Create Customer.data.customerId}}",
+        "orderType": "{{orderType}}",
+        "currency": "{{currency}}",
+        "items": [
+            {
+                "productCode": "LAPTOP-001",
+                "quantity": 1
+            },
+            {
+                "productCode": "MOUSE-001",
+                "quantity": 2
+            }
+        ]
+    }
+}
+
+# Step 3: Approve the order using values returned by the previous services.
+#
+# This assumes Create Order returns data.orderId and Create Customer
+# returns data.customerId.
+service "Approve Order" {
+    id: OrderApp@ApproveOrder
+    {
+        "orderId": "{{Create Order.data.orderId}}",
+        "customerId": "{{Create Customer.data.customerId}}",
+        "approvedBy": "{{username}}",
+        "approvalSource": "{{environmentName}}"
+    }
+}
+
+# Optional independent service: demonstrates environment variables
+# without using values from another service.
+service "Get Customer" {
+    id: CustomerApp@GetCustomer
+    {
+        "email": "{{customerEmail}}"
+    }
+}
+
+# Optional service: demonstrates sharing a nested value from Create Order.
+# Assumes the response contains data.order.totalAmount.
+service "Send Order Confirmation" {
+    id: OrderApp@SendOrderConfirmation
+    {
+        "orderId": "{{Create Order.data.orderId}}",
+        "customerEmail": "{{customerEmail}}",
+        "totalAmount": "{{Create Order.data.order.totalAmount}}",
+        "currency": "{{currency}}"
+    }
+}
