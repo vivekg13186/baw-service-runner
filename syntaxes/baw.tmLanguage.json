@@ -1,0 +1,29 @@
+{
+  "scopeName": "source.baw",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#keywords" },
+    { "include": "#strings" },
+    { "include": "#keys" }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.number-sign.baw",
+      "match": "#.*$"
+    },
+    "keywords": {
+      "name": "keyword.control.baw",
+      "match": "\\b(env|service|id|url|username|password)\\b"
+    },
+    "strings": {
+      "name": "string.quoted.double.baw",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [{ "name": "constant.character.escape.baw", "match": "\\\\." }]
+    },
+    "keys": {
+      "name": "support.type.property-name.baw",
+      "match": "(?<=\\{|,)\\s*[A-Za-z_][A-Za-z0-9_]*(?=\\s*:)"
+    }
+  }
+}
