@@ -16,6 +16,26 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "languages": [
+      {
+        "id": "baw",
+        "aliases": [
+          "BAW",
+          "baw"
+        ],
+        "extensions": [
+          ".baw"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "baw",
+        "scopeName": "source.baw",
+        "path": "./syntaxes/baw.tmLanguage.json"
+      }
+    ],
     "commands": [
       {
         "command": "baw.setEnvironment",
@@ -41,7 +61,54 @@
         "command": "baw.runSequence",
         "title": "BAW: Run Sequence"
       }
-    ]
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "baw.setEnvironment",
+          "when": "editorLangId == baw",
+          "group": "navigation"
+        },
+        {
+          "command": "baw.showResponse",
+          "when": "editorLangId == baw",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "baw.runSequence",
+          "when": "editorLangId == baw",
+          "group": "baw@1"
+        },
+        {
+          "command": "baw.clearSharedVariables",
+          "when": "editorLangId == baw",
+          "group": "baw@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "BAW Service Runner",
+      "properties": {
+        "baw.stopSequenceOnError": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stop sequence execution when a service fails."
+        },
+        "baw.clearVariablesBeforeSequence": {
+          "type": "boolean",
+          "default": false,
+          "description": "Clear shared service variables before running a sequence."
+        },
+        "baw.requestTimeout": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 1000,
+          "description": "HTTP request timeout in milliseconds."
+        }
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",
